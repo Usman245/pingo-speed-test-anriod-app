@@ -5,6 +5,8 @@ import Field from '../components/Field';
 import Segmented from '../components/Segmented';
 import { Card } from '../components/Card';
 
+const PROTOCOL_OPTION_STYLE = { paddingVertical: 10, paddingHorizontal: 22 };
+
 export default function AddProxy({ toProxy }) {
   const [protocol, setProtocol] = useState('socks5');
 
@@ -27,7 +29,7 @@ export default function AddProxy({ toProxy }) {
             ]}
             value={protocol}
             onChange={setProtocol}
-            optionClassName="py-2.5 px-[22px]"
+            optionStyle={PROTOCOL_OPTION_STYLE}
           />
         </View>
         <View className="flex-row gap-3">

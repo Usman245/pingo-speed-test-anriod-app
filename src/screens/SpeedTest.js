@@ -1,19 +1,29 @@
 import { useEffect, useRef, useState } from 'react';
-import { View, Text, Animated } from 'react-native';
+import { View, Text, Animated, Easing } from 'react-native';
 import Button from '../components/Button';
 import { Card } from '../components/Card';
 import RingGauge from '../components/RingGauge';
 import Sparkline from '../components/Sparkline';
-import { measureLatency, measureDownload, measureUpload, WARMUP_MS } from '../lib/speedTestEngine';
+import {
+  measureLatency,
+  measureDownload,
+  measureUpload,
+  pickBestServer,
+  WARMUP_MS,
+} from '../lib/speedTestEngine';
 import { speedToRing, formatSpeed, speedLabel } from '../lib/format';
 
-const PING_SAMPLES = 6;
-// 1s of warm-up is discarded inside the engine, so each phase measures ~6s.
-const PHASE_MS = WARMUP_MS + 6000;
+const PING_SAMPLES = 10;
+// 1s of warm-up is discarded inside the engine, so each phase measures 10s.
+const PHASE_MS = WARMUP_MS + 10000;
 // The engine ticks ~8x a second. Re-rendering this screen that often janks a
 // mid-range phone, so text redraws at 5Hz and the ring sweeps via Animated.
 const FRAME_MS = 200;
 const MAX_SAMPLES = 24;
+// A sweep outlasts the gap between engine ticks and eases linearly, so each
+// one is still in motion when the next re-aims it: the needle reads as one
+// continuous motion instead of restarting an ease curve 8 times a second.
+const SWEEP_MS = 200;
 
 const SAVE_LABEL = {
   saving: 'Saving…',
@@ -23,9 +33,10 @@ const SAVE_LABEL = {
 };
 
 const STEP_LABEL = {
-  ping: 'Step 1 of 3 · ping',
-  download: 'Step 2 of 3 · download',
-  upload: 'Step 3 of 3 · upload',
+  connect: 'Choosing the closest server…',
+  latency: 'Measuring latency…',
+  download: 'Step 1 of 2 · download',
+  upload: 'Step 2 of 2 · upload',
 };
 
 function headerNow() {
@@ -33,6 +44,10 @@ function headerNow() {
   const day = d.toLocaleDateString([], { weekday: 'long' });
   const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   return `${day} · ${time}`;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export default function SpeedTest({
@@ -52,9 +67,14 @@ export default function SpeedTest({
   avatarInitials,
   units,
   serverLabel,
+  ispName,
+  connectionLabel,
+  deviceName,
 }) {
   const [now] = useState(headerNow);
   const [sub, setSub] = useState('idle');
+  const [error, setError] = useState(null);
+  const [node, setNode] = useState(null);
   const [ui, setUi] = useState({ value: 0, pct: 0, samples: [] });
   const [live, setLive] = useState({ download: null, upload: null, ping: null, jitter: null });
 
@@ -64,13 +84,10 @@ export default function SpeedTest({
   const progressRef = useRef(0);
   const samplesRef = useRef([]);
 
-  const sweepTo = (value) => {
-    Animated.timing(ring, {
-      toValue: speedToRing(value),
-      duration: 220,
-      useNativeDriver: false,
-    }).start();
+  const animateRing = (toValue, duration, easing) => {
+    Animated.timing(ring, { toValue, duration, easing, useNativeDriver: false }).start();
   };
+  const sweepTo = (value) => animateRing(speedToRing(value), SWEEP_MS, Easing.linear);
 
   // One timer drives every text update on this screen.
   useEffect(() => {
@@ -88,18 +105,21 @@ export default function SpeedTest({
   useEffect(() => {
     if (phase === 'idle') {
       setSub('idle');
+      setError(null);
       setLive({ download: null, upload: null, ping: null, jitter: null });
       targetRef.current = 0;
       displayRef.current = 0;
       progressRef.current = 0;
       samplesRef.current = [];
       setUi({ value: 0, pct: 0, samples: [] });
-      Animated.timing(ring, { toValue: 0, duration: 260, useNativeDriver: false }).start();
+      animateRing(0, 260, Easing.out(Easing.quad));
       return undefined;
     }
 
     if (phase === 'done') {
-      if (result) sweepTo(result.download);
+      // The final reading settles rather than tracking: one slower sweep that
+      // eases into the result, instead of the linear chase used while live.
+      if (result) animateRing(speedToRing(result.download), 700, Easing.out(Easing.cubic));
       return undefined;
     }
 
@@ -110,7 +130,9 @@ export default function SpeedTest({
       displayRef.current = 0;
       progressRef.current = 0;
       samplesRef.current = [];
-      ring.setValue(0);
+      // Drop back to zero on the way into a phase rather than snapping, so
+      // handing over from download to upload reads as one movement.
+      animateRing(0, 320, Easing.out(Easing.quad));
     };
     const onTick = (value, p) => {
       if (cancelToken.cancelled) return;
@@ -120,26 +142,56 @@ export default function SpeedTest({
     };
 
     (async () => {
-      reset('ping');
-      const ping = await measureLatency(PING_SAMPLES, cancelToken, (rtt, i) => {
+      try {
+        // Races the configured fleet and keeps the closest node. The result is
+        // cached for a few minutes, so a repeat test starts measuring at once.
+        reset('connect');
+        // Keep the connection state visible long enough to reassure the user
+        // that a real server race is taking place, even on a warm cache.
+        const [server] = await Promise.all([pickBestServer(), wait(850)]);
         if (cancelToken.cancelled) return;
-        targetRef.current = rtt;
-        progressRef.current = i / PING_SAMPLES;
-      });
-      if (cancelToken.cancelled) return;
-      setLive((l) => ({ ...l, ping: ping.latency, jitter: ping.jitter }));
+        setNode(server);
 
-      reset('download');
-      const download = await measureDownload(PHASE_MS, cancelToken, onTick);
-      if (cancelToken.cancelled) return;
-      setLive((l) => ({ ...l, download }));
+        // Latency runs on its own, before any bulk data moves, and never takes
+        // over the dial — only the step bar advances. Sampling it underneath a
+        // saturated download would report queuing delay rather than the path,
+        // and would steal throughput from the reading it runs alongside.
+        reset('latency');
+        const ping = await measureLatency(server, PING_SAMPLES, cancelToken, (_rtt, taken) => {
+          if (cancelToken.cancelled) return;
+          progressRef.current = taken / PING_SAMPLES;
+        });
+        if (cancelToken.cancelled) return;
+        setLive((l) => ({ ...l, ping: ping.latency, jitter: ping.jitter }));
 
-      reset('upload');
-      const upload = await measureUpload(PHASE_MS, cancelToken, onTick);
-      if (cancelToken.cancelled) return;
-      setLive((l) => ({ ...l, upload }));
+        reset('download');
+        const download = await measureDownload(server, PHASE_MS, cancelToken, onTick);
+        if (cancelToken.cancelled) return;
+        setLive((l) => ({ ...l, download: download.mbps }));
 
-      onDone({ download, upload, latency: ping.latency, jitter: ping.jitter, loss: 0 });
+        reset('upload');
+        const upload = await measureUpload(server, PHASE_MS, cancelToken, onTick);
+        if (cancelToken.cancelled) return;
+        setLive((l) => ({ ...l, upload: upload.mbps }));
+
+        onDone({
+          download: download.mbps,
+          upload: upload.mbps,
+          latency: ping.latency,
+          jitter: ping.jitter,
+          loss: ping.loss,
+          // Kept alongside the averages: the best sustained second of each
+          // phase, which is what a burst-friendly link is actually capable of.
+          downloadPeak: download.peakMbps,
+          uploadPeak: upload.peakMbps,
+          serverId: server.id,
+          serverName: server.label,
+        });
+      } catch (e) {
+        if (cancelToken.cancelled) return;
+        setError(e?.message || 'Test failed');
+        onCancel?.();
+      }
     })();
 
     return () => {
@@ -149,18 +201,16 @@ export default function SpeedTest({
 
   const running = phase === 'running';
   const done = phase === 'done';
-  const pinging = running && sub === 'ping';
   const uploading = running && sub === 'upload';
+  const measuring = running && (sub === 'download' || sub === 'upload');
 
-  const bigValue = pinging
-    ? String(Math.round(ui.value))
-    : running
-      ? formatSpeed(ui.value, units)
-      : done && result
-        ? formatSpeed(result.download, units)
-        : formatSpeed(0, units);
-  const bigUnit = pinging ? 'ms' : speedLabel(units);
-  const centreLabel = pinging ? 'Ping' : uploading ? 'Upload' : 'Download';
+  const bigValue = running
+    ? formatSpeed(ui.value, units)
+    : done && result
+      ? formatSpeed(result.download, units)
+      : formatSpeed(0, units);
+  const bigUnit = speedLabel(units);
+  const centreLabel = uploading ? 'Upload' : 'Download';
 
   const metrics = uploading
     ? [
@@ -184,15 +234,21 @@ export default function SpeedTest({
         },
       ];
 
-  const pillText = pinging
-    ? 'Measuring ping…'
-    : running
-      ? `${uploading ? 'Upload' : 'Download'} · ${serverLabel || 'nearest edge'}`
-      : done
-        ? percentile !== null
-          ? `Faster than ${percentile}% of your tests`
-          : 'Test complete'
-        : 'Tap start when ready';
+  const activeServer = node?.label || serverLabel || 'nearest server';
+  const serverPlace = node?.city || node?.name || serverLabel || 'Selecting server';
+  const pillText = error
+    ? error
+    : sub === 'connect' && running
+      ? 'Finding the closest server…'
+      : sub === 'latency' && running
+        ? 'Checking latency…'
+        : running
+          ? `${uploading ? 'Upload' : 'Download'} · ${activeServer}`
+          : done
+            ? percentile !== null
+              ? `Faster than ${percentile}% of your tests`
+              : 'Test complete'
+            : 'Tap start when ready';
 
   return (
     <View className="flex-1 pt-[18px] px-[18px]">
@@ -213,14 +269,14 @@ export default function SpeedTest({
 
         <View className="relative mt-2" style={{ width: 230, height: 230 }}>
           <RingGauge progress={ring} />
-          <View className="absolute inset-0 items-center justify-center">
+          <View className="absolute inset-0 items-center justify-center" pointerEvents="none">
             <Text className="text-[11.5px] font-o8 tracking-[0.16em] uppercase text-muted1">{centreLabel}</Text>
             <Text className="font-o9 text-[64px] leading-[65px] tracking-[-0.05em] text-ink">{bigValue}</Text>
             <Text className="text-[13px] font-o8 text-muted1">{bigUnit}</Text>
           </View>
         </View>
 
-        {running && !pinging ? (
+        {measuring ? (
           <View className="w-full mt-1 mb-1">
             <Sparkline samples={ui.samples} />
           </View>
@@ -281,10 +337,27 @@ export default function SpeedTest({
       )}
 
       {done ? (
-        <View className="flex-row items-center justify-between mt-3 px-1">
-          <Text className="text-xs font-o7 text-muted1">{SAVE_LABEL[saveStatus] || SAVE_LABEL.local}</Text>
-          <Button title="Connection details" variant="link" onPress={toDetails} />
-        </View>
+        <>
+          <Card className="mt-3.5 px-4 py-3.5">
+            <View className="flex-row items-center justify-between">
+              <View className="flex-1 pr-3">
+                <Text className="text-[10.5px] font-o8 tracking-[0.12em] uppercase text-muted1">Your network</Text>
+                <Text numberOfLines={1} className="text-[16px] font-o9 tracking-[-0.02em] mt-1 text-ink">{ispName || 'Looking up provider'}</Text>
+                <Text numberOfLines={1} className="text-[11.5px] font-o7 text-muted1 mt-1">{connectionLabel || 'Network'} · {deviceName || 'This device'}</Text>
+              </View>
+              <View className="w-px h-10 bg-track" />
+              <View className="flex-1 pl-3">
+                <Text className="text-[10.5px] font-o8 tracking-[0.12em] uppercase text-muted1">Test server</Text>
+                <Text numberOfLines={1} className="text-[16px] font-o9 tracking-[-0.02em] mt-1 text-ink">{activeServer}</Text>
+                <Text numberOfLines={1} className="text-[11.5px] font-o7 text-muted1 mt-1">{serverPlace}</Text>
+              </View>
+            </View>
+          </Card>
+          <View className="flex-row items-center justify-between mt-3 px-1">
+            <Text className="text-xs font-o7 text-muted1">{SAVE_LABEL[saveStatus] || SAVE_LABEL.local}</Text>
+            <Button title="Connection details" variant="link" onPress={toDetails} />
+          </View>
+        </>
       ) : null}
     </View>
   );

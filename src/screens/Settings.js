@@ -83,7 +83,6 @@ export default function Settings({
             ]}
             value={units}
             onChange={onUnitsChange}
-            optionClassName="py-2 px-4"
           />
         </View>
         <View className="flex-row items-center justify-between gap-3">
@@ -95,7 +94,6 @@ export default function Settings({
             ]}
             value={autosave ? 'on' : 'off'}
             onChange={(v) => onAutosaveChange(v === 'on')}
-            optionClassName="py-2 px-4"
           />
         </View>
       </Card>

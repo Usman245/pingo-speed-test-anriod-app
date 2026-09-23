@@ -1,0 +1,16 @@
+services:
+  speed:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Bound to localhost: Nginx on the host terminates TLS and proxies here.
+      # Drop the 127.0.0.1 prefix only if you are exposing plain HTTP on purpose.
+      - "127.0.0.1:8080:8080"
+    # A speed test is network-bound, not CPU-bound, but an unbounded container
+    # on a shared box can still starve the reverse proxy under load.
+    deploy:
+      resources:
+        limits:
+          memory: 256M

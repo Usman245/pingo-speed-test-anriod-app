@@ -3,6 +3,7 @@
     "name": "Pingo",
     "slug": "pingo",
     "version": "1.0.0",
+    "scheme": "pingo",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -32,7 +33,9 @@
           "backgroundColor": "#0d0d0d",
           "resizeMode": "contain"
         }
-      ]
+      ],
+      "expo-router",
+      "expo-status-bar"
     ]
   }
 }
